@@ -24,6 +24,7 @@ use std::mem::{replace, swap};
 use std::cmp::{PartialOrd, Ordering};
 
 use sid::{Id, IdVec};
+use std::f32;
 
 use FillVertex as Vertex;
 use {FillOptions, FillRule, Side, OnError};
@@ -1652,7 +1653,7 @@ impl FlatPathBuilder for EventsBuilder {
 
 /// Helper class that generates a triangulation from a sequence of vertices describing a monotone
 /// polygon (used internally by the `FillTessellator`).
-struct MonotoneTessellator {
+struct BasicMonotoneTessellator {
     stack: Vec<MonotoneVertex>,
     previous: MonotoneVertex,
     triangles: Vec<(VertexId, VertexId, VertexId)>,
@@ -1665,9 +1666,9 @@ struct MonotoneVertex {
     side: Side,
 }
 
-impl MonotoneTessellator {
+impl BasicMonotoneTessellator {
     pub fn new() -> Self {
-        MonotoneTessellator {
+        BasicMonotoneTessellator {
             stack: Vec::with_capacity(16),
             triangles: Vec::with_capacity(128),
             // Some placeholder value that will be replaced right away.
@@ -1679,7 +1680,7 @@ impl MonotoneTessellator {
         }
     }
 
-    pub fn begin(mut self, pos: Point, id: VertexId) -> MonotoneTessellator {
+    pub fn begin(mut self, pos: Point, id: VertexId) -> Self {
         let first = MonotoneVertex {
             pos,
             id,
@@ -1696,7 +1697,6 @@ impl MonotoneTessellator {
 
     pub fn vertex(&mut self, pos: Point, id: VertexId, side: Side) {
         let current = MonotoneVertex { pos, id, side };
-
         // cf. test_fixed_to_f32_precision
         // TODO: investigate whether we could do the conversion without this
         // precision issue. Otherwise we could also make MonotoneTessellator
@@ -1770,6 +1770,167 @@ impl MonotoneTessellator {
         self.triangles.clear();
     }
 }
+
+struct MonotoneEvent {
+    vertex: MonotoneVertex,
+    done: bool,
+}
+
+struct AdvancedMonotoneTessellator2 {
+    tess: BasicMonotoneTessellator,
+    left_events: Vec<MonotoneVertex>,
+    right_events: Vec<MonotoneVertex>,
+    left_x: f32,
+    right_x: f32,
+    dy: f32,
+    flushing: bool,
+}
+
+impl AdvancedMonotoneTessellator2 {
+    pub fn new() -> Self {
+        AdvancedMonotoneTessellator2 {
+            left_events: Vec::with_capacity(32),
+            right_events: Vec::with_capacity(32),
+            tess: BasicMonotoneTessellator::new(),
+            left_x: f32::MIN,
+            right_x: f32::MAX,
+            dy: 0.0,
+            flushing: false,
+        }
+    }
+
+    pub fn begin(self, pos: Point, id: VertexId) -> Self {
+        let mut tess = AdvancedMonotoneTessellator2 {
+            left_events: Vec::with_capacity(32),
+            right_events: Vec::with_capacity(32),
+            tess: self.tess.begin(pos, id),
+            left_x: f32::MIN,
+            right_x: f32::MAX,
+            dy: 0.0,
+            flushing: false,
+        };
+
+        tess.left_events.push(MonotoneVertex { pos, id, side: Side::Left });
+        tess.right_events.push(MonotoneVertex { pos, id, side: Side::Right });
+
+        tess
+    }
+
+    pub fn vertex(&mut self, pos: Point, id: VertexId, side: Side) {
+        match side {
+            Side::Left => {
+                self.left_x = self.left_x.max(pos.x);
+            }
+            Side::Right => {
+                self.right_x = self.right_x.min(pos.x);
+            }
+        }
+
+        let dx = self.right_x - self.left_x;
+
+        if dx < self.dy {
+            self.flush_side(Side::Left);
+            self.flush_side(Side::Right);
+        } else {
+            let outward_turn = {
+                let (side_events, sign) = match side {
+                    Side::Left => (&mut self.left_events, 1.0),
+                    Side::Right => (&mut self.right_events, -1.0),
+                };
+
+                let len = side_events.len();
+
+                if len >= 2 {
+                    let a = side_events[len - 2];
+                    let b = side_events[len - 1];
+                    (a.pos - b.pos).cross(pos - b.pos) * sign < 0.0
+                } else {
+                    false
+                }
+            };
+
+            if outward_turn {
+                self.flush_side(side);
+            }
+        }
+
+        match side {
+            Side::Left => &mut self.left_events,
+            Side::Right => &mut self.right_events,
+        }.push(MonotoneVertex { pos, id, side });
+    }
+
+    pub fn end(&mut self, pos: Point, id: VertexId) {
+        self.flush_side(Side::Left);
+        self.flush_side(Side::Right);
+
+        self.tess.end(pos, id);
+    }
+
+    fn flush_side(&mut self, side: Side) {
+        let side_events = match side {
+            Side::Left => &mut self.left_events,
+            Side::Right => &mut self.right_events,
+        };
+
+        let len = side_events.len();
+        if len < 2 {
+            return;
+        }
+
+        let log_len = f32::log2(len as f32) as usize + 1;
+        let mut step = 1;
+        while step <= log_len {
+            let mut last_index = 0;
+            for i in 0 .. (len - 1) / (2 * step) {
+                let mut a = i * 2 * step;
+                let mut b = a + step;
+                last_index = a + 2 * step;
+                if side == Side::Right {
+                    swap(&mut a, &mut b);
+                }
+                self.tess.push_triangle(
+                    &side_events[a],
+                    &side_events[b],
+                    &side_events[last_index],
+                );
+            }
+
+            if last_index + step < len {
+                let (b, c) = match side {
+                    Side::Left => (last_index, last_index + step),
+                    Side::Right => (last_index + step, last_index),
+                };
+                self.tess.push_triangle(
+                    &side_events[0],
+                    &side_events[b],
+                    &side_events[c],
+                );
+            }
+
+            step *= 2;
+        }
+
+        let last = *side_events.last().unwrap();
+
+        side_events.clear();
+        side_events.push(last);
+
+        match side {
+            Side::Left => { self.left_x = last.pos.x; }
+            Side::Right => { self.right_x = last.pos.x; }
+        }
+
+        self.tess.vertex(last.pos, last.id, last.side);
+    }
+
+    fn flush(&mut self, output: &mut dyn GeometryBuilder<Vertex>) {
+        self.tess.flush(output);
+    }
+}
+
+type MonotoneTessellator = AdvancedMonotoneTessellator2;
+//type MonotoneTessellator = BasicMonotoneTessellator;
 
 #[test]
 fn test_monotone_tess() {
